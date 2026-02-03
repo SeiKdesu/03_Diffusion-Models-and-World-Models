@@ -20,6 +20,10 @@ class DiffusionSamplerConfig:
     s_noise: float = 1
     s_cond: float = 0
 
+    # Consistency model (蒸留後) を使う場合
+    use_consistency: bool = False
+    sigma_min_consistency: float = 2e-3
+
 
 class DiffusionSampler:
     def __init__(self, denoiser: Denoiser, cfg: DiffusionSamplerConfig) -> None:
@@ -47,7 +51,19 @@ class DiffusionSampler:
                 prev_obs = self.denoiser.apply_noise(prev_obs, sigma_cond, sigma_offset_noise=0)
             else:
                 sigma_cond = None
-            denoised = self.denoiser.denoise(x, sigma, sigma_cond, prev_obs, prev_act)
+            if self.cfg.use_consistency:
+                denoised = self.denoiser.denoise_consistency(
+                    x,
+                    sigma,
+                    sigma_cond,
+                    prev_obs,
+                    prev_act,
+                    sigma_min=self.cfg.sigma_min_consistency,
+                    clip=True,
+                    quantize=False,
+                )
+            else:
+                denoised = self.denoiser.denoise(x, sigma, sigma_cond, prev_obs, prev_act)
             d = (x - denoised) / sigma_hat
             dt = next_sigma - sigma_hat
             if self.cfg.order == 1 or next_sigma == 0:
@@ -56,7 +72,19 @@ class DiffusionSampler:
             else:
                 # Heun's method
                 x_2 = x + d * dt
-                denoised_2 = self.denoiser.denoise(x_2, next_sigma * s_in, sigma_cond, prev_obs, prev_act)
+                if self.cfg.use_consistency:
+                    denoised_2 = self.denoiser.denoise_consistency(
+                        x_2,
+                        next_sigma * s_in,
+                        sigma_cond,
+                        prev_obs,
+                        prev_act,
+                        sigma_min=self.cfg.sigma_min_consistency,
+                        clip=True,
+                        quantize=False,
+                    )
+                else:
+                    denoised_2 = self.denoiser.denoise(x_2, next_sigma * s_in, sigma_cond, prev_obs, prev_act)
                 d_2 = (x_2 - denoised_2) / next_sigma
                 d_prime = (d + d_2) / 2
                 x = x + d_prime * dt

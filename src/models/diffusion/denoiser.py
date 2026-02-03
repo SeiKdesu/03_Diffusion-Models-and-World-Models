@@ -77,6 +77,29 @@ class Denoiser(nn.Module):
         c_noise_cond = sigma_cond.log() / 4 if sigma_cond is not None else torch.zeros_like(c_noise)
         return Conditioners(*(add_dims(c, n) for c, n in zip((c_in, c_out, c_skip, c_noise, c_noise_cond), (4, 4, 4, 1, 1))))
 
+    def compute_conditioners_consistency(
+        self,
+        sigma: Tensor,
+        sigma_min: float,
+        sigma_cond: Optional[Tensor],
+    ) -> Conditioners:
+        """Consistency distillation/training 用の boundary condition 付き preconditioning。
+
+        consistency_models の get_scalings_for_boundary_condition に対応。
+        本リポジトリでは sigma_offset_noise を使うため、sigma空間を合わせた上で計算する。
+        """
+        sigma_eff = (sigma**2 + self.cfg.sigma_offset_noise**2).sqrt()
+        sigma_min_t = torch.as_tensor(sigma_min, device=sigma.device, dtype=sigma.dtype)
+        sigma_min_eff = (sigma_min_t**2 + self.cfg.sigma_offset_noise**2).sqrt()
+
+        c_in = 1 / (sigma_eff**2 + self.cfg.sigma_data**2).sqrt()
+        c_skip = self.cfg.sigma_data**2 / ((sigma_eff - sigma_min_eff) ** 2 + self.cfg.sigma_data**2)
+        c_out = (sigma_eff - sigma_min_eff) * self.cfg.sigma_data / (sigma_eff**2 + self.cfg.sigma_data**2).sqrt()
+
+        c_noise = sigma_eff.log() / 4
+        c_noise_cond = sigma_cond.log() / 4 if sigma_cond is not None else torch.zeros_like(c_noise)
+        return Conditioners(*(add_dims(c, n) for c, n in zip((c_in, c_out, c_skip, c_noise, c_noise_cond), (4, 4, 4, 1, 1))))
+
     def compute_model_output(self, noisy_next_obs: Tensor, obs: Tensor, act: Optional[Tensor], cs: Conditioners) -> Tensor:
         rescaled_obs = obs / self.cfg.sigma_data
         rescaled_noise = noisy_next_obs * cs.c_in
@@ -94,6 +117,34 @@ class Denoiser(nn.Module):
         cs = self.compute_conditioners(sigma, sigma_cond)
         model_output = self.compute_model_output(noisy_next_obs, obs, act, cs)
         denoised = self.wrap_model_output(noisy_next_obs, model_output, cs)
+        return denoised
+
+    @torch.no_grad()
+    def denoise_consistency(
+        self,
+        noisy_next_obs: Tensor,
+        sigma: Tensor,
+        sigma_cond: Optional[Tensor],
+        obs: Tensor,
+        act: Optional[Tensor],
+        *,
+        sigma_min: float,
+        clip: bool = True,
+        quantize: bool = False,
+    ) -> Tensor:
+        """Consistency model(蒸留後)としての denoise。
+
+        - boundary condition付き preconditioning を使う
+        - 既存の `denoise()` と違い、デフォルトでは量子化しない
+        """
+        cs = self.compute_conditioners_consistency(sigma=sigma, sigma_min=sigma_min, sigma_cond=sigma_cond)
+        model_output = self.compute_model_output(noisy_next_obs, obs, act, cs)
+        if quantize:
+            denoised = self.wrap_model_output(noisy_next_obs, model_output, cs)
+        else:
+            denoised = cs.c_skip * noisy_next_obs + cs.c_out * model_output
+            if clip:
+                denoised = denoised.clamp(-1, 1)
         return denoised
     
     def forward(self, batch: Batch) -> LossAndLogs:

@@ -18,7 +18,9 @@ class BatchSampler(torch.utils.data.Sampler):
         sample_weights: Optional[List[float]] = None,
         can_sample_beyond_end: bool = False,
     ) -> None:
-        super().__init__(dataset)
+        # PyTorchのバージョン差で Sampler.__init__ が data_source を受け取らない場合があるため、
+        # ここでは引数なしで呼ぶ（data_source は内部的に未使用）。
+        super().__init__()
         assert isinstance(dataset, (Dataset, CSGOHdf5Dataset))
         self.dataset = dataset
         self.rank = rank

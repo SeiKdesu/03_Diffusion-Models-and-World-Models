@@ -1,0 +1,54 @@
+defaults:
+  - _self_
+  - env: csgo
+  - agent: csgo
+
+hydra:
+  job:
+    chdir: True
+
+component: denoiser
+
+teacher:
+  path_to_ckpt: "G:/マイドライブ/world_model/final/03_Diffusion-Models-and-World-Models/src/models/pretrained/csgo.pt"
+
+training:
+  batch_size: 16
+  num_workers_data_loaders: 4
+  cache_in_ram: False
+  total_steps: 200000
+  log_every: 50
+  save_every: 2000
+  out_dir: "G:/マイドライブ/world_model/final/03_Diffusion-Models-and-World-Models/"
+  seed: 0
+
+optimizer:
+  lr: 1e-4
+  weight_decay: 1e-2
+  eps: 1e-8
+  max_grad_norm: 10.0
+
+amp:
+  enabled: True
+
+ema:
+  rate: 0.999
+
+consistency:
+  num_scales: 18
+  sigma_min: 2e-3
+  sigma_max: 5.0
+  rho: 7
+  weight_schedule: karras  
+  loss_norm: l2           
+
+  solver: heun            
+
+  s_cond: 0.005
+
+static_dataset:
+  path: ${env.path_data_low_res}
+  ignore_sample_weights: True
+
+sequence:
+  num_autoregressive_steps: 0

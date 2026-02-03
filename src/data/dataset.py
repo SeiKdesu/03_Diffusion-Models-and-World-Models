@@ -152,7 +152,10 @@ class Dataset(StateDictMixin, TorchDataset):
 
     def load_from_default_path(self) -> None:
         if self._default_path.is_file():
-            self.load_state_dict(torch.load(self._default_path))
+            # PyTorch 2.6+ では torch.load のデフォルトが weights_only=True になり、
+            # Tensor以外を含むstate_dict(本データセットのinfo.pt)が読めず UnpicklingError になる。
+            # 信頼できるローカルデータである前提で weights_only=False を明示する。
+            self.load_state_dict(torch.load(self._default_path, weights_only=False))
 
 
 class CSGOHdf5Dataset(StateDictMixin, TorchDataset):
