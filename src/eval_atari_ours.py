@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rl-episodes", type=int, default=20)
     parser.add_argument("--rl-lr", type=float, default=3e-4)
     parser.add_argument("--rl-seed", type=int, default=0)
+    parser.add_argument("--rl-log-every", type=int, default=50)
     parser.add_argument("--deterministic", action="store_true")
     return parser.parse_args()
 
@@ -232,6 +233,7 @@ def rl_train_and_eval(
     seed: int,
     deterministic: bool,
     steps: int,
+    log_every: int,
 ) -> Tuple[float, float]:
     torch.manual_seed(seed)
     n = denoiser.cfg.inner_model.num_steps_conditioning
@@ -269,11 +271,15 @@ def rl_train_and_eval(
 
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
     policy.train()
-    for _ in range(updates):
+    start = time.perf_counter()
+    for i in range(1, updates + 1):
         loss, _ = policy()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        if log_every > 0 and (i == 1 or i % log_every == 0 or i == updates):
+            elapsed = time.perf_counter() - start
+            print(f"[rl] update {i}/{updates} loss={loss.item():.4f} elapsed={elapsed:.1f}s")
 
     # Evaluate in real env
     test_env = make_atari_env(num_envs=1, device=device, **env_cfg.test)
@@ -292,6 +298,8 @@ def rl_train_and_eval(
             ret += rew.item()
             done = bool((end + trunc).item())
         returns.append(ret)
+        if log_every > 0 and (ep == 0 or (ep + 1) % max(1, log_every // 5) == 0 or ep + 1 == episodes):
+            print(f"[rl] eval episode {ep + 1}/{episodes} return={ret:.2f}")
 
     return float(np.mean(returns)), float(np.std(returns))
 
@@ -443,6 +451,7 @@ def main() -> None:
                     seed=args.rl_seed,
                     deterministic=args.deterministic,
                     steps=1 if model_name == "student" else args.teacher_steps,
+                    log_every=args.rl_log_every,
                 )
                 rl_rows.append(
                     {
