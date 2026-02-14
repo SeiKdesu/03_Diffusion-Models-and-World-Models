@@ -90,6 +90,22 @@ class Denoiser(nn.Module):
         denoised = self.wrap_model_output(noisy_next_obs, model_output, cs)
         return denoised
 
+    def denoise_with_grad(
+        self,
+        noisy_next_obs: Tensor,
+        sigma: Tensor,
+        obs: Tensor,
+        act: Tensor,
+        *,
+        clip: bool = True,
+    ) -> Tensor:
+        cs = self.compute_conditioners(sigma)
+        model_output = self.compute_model_output(noisy_next_obs, obs, act, cs)
+        denoised = cs.c_skip * noisy_next_obs + cs.c_out * model_output
+        if clip:
+            denoised = denoised.clamp(-1, 1)
+        return denoised
+
     def forward(self, batch: Batch) -> LossAndLogs:
         n = self.cfg.inner_model.num_steps_conditioning
         seq_length = batch.obs.size(1) - n
