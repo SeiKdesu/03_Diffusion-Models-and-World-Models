@@ -62,6 +62,12 @@ def download_atari_config() -> tuple[Path, Path]:
     return path_agent, path_env
 
 
+def resolve_agent_cfg(cfg_agent):
+    container = OmegaConf.create({"agent": cfg_agent})
+    OmegaConf.resolve(container)
+    return container.agent
+
+
 def resolve_dataset_path(dataset_dir: str, game_base: str) -> Path:
     p = Path(dataset_dir.format(game=game_base))
     if (p / "info.pt").is_file():
@@ -113,8 +119,9 @@ def main() -> None:
     device = torch.device(args.device) if args.device else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     game_base = normalize_game_name(args.game)
+    OmegaConf.register_new_resolver("eval", eval)
     path_agent_cfg, path_env_cfg = download_atari_config()
-    cfg_agent = OmegaConf.load(path_agent_cfg)
+    cfg_agent = resolve_agent_cfg(OmegaConf.load(path_agent_cfg))
     cfg_env = OmegaConf.load(path_env_cfg)
     cfg_env.train.id = cfg_env.test.id = f"{game_base}NoFrameskip-v4"
 
