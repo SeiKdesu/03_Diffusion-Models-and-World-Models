@@ -62,8 +62,8 @@ def download_atari_config() -> tuple[Path, Path]:
     return path_agent, path_env
 
 
-def resolve_agent_cfg(cfg_agent):
-    container = OmegaConf.create({"agent": cfg_agent})
+def resolve_agent_cfg(cfg_agent, cfg_env):
+    container = OmegaConf.create({"agent": cfg_agent, "env": cfg_env})
     OmegaConf.resolve(container)
     return container.agent
 
@@ -121,9 +121,9 @@ def main() -> None:
     game_base = normalize_game_name(args.game)
     OmegaConf.register_new_resolver("eval", eval)
     path_agent_cfg, path_env_cfg = download_atari_config()
-    cfg_agent = resolve_agent_cfg(OmegaConf.load(path_agent_cfg))
     cfg_env = OmegaConf.load(path_env_cfg)
     cfg_env.train.id = cfg_env.test.id = f"{game_base}NoFrameskip-v4"
+    cfg_agent = resolve_agent_cfg(OmegaConf.load(path_agent_cfg), cfg_env)
 
     path_teacher = download_atari_teacher(game_base)
 
