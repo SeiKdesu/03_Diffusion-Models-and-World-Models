@@ -117,6 +117,9 @@ def main() -> None:
     random.seed(args.seed)
 
     device = torch.device(args.device) if args.device else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda" and args.num_workers > 0:
+        print("[distill] CUDA + DataLoader workers can crash in fork mode. Forcing --num-workers 0.")
+        args.num_workers = 0
 
     game_base = normalize_game_name(args.game)
     OmegaConf.register_new_resolver("eval", eval)
