@@ -1,0 +1,13 @@
+train:
+  id: ALE/Breakout-v5
+  done_on_life_loss: True
+  size: 64
+  max_episode_steps: 108000
+test:
+  id: ALE/Breakout-v5
+  done_on_life_loss: False
+  size: 64
+  max_episode_steps: 108000
+path_data_low_res: null
+path_data_full_res: null
+keymap: atari

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from itertools import cycle
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -12,10 +12,11 @@ import torch.nn.functional as F
 from coroutines import coroutine
 from models.diffusion import Denoiser, DiffusionSampler, DiffusionSamplerConfig
 from models.rew_end_model import RewEndModel
+from data import Batch
 
 ResetOutput = Tuple[torch.FloatTensor, Dict[str, Any]]
 StepOutput = Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Any]]
-InitialCondition = Tuple[Tensor, Tensor, Tuple[Tensor, Tensor]]
+InitialCondition = Tuple[Tensor, Optional[Tensor], Tuple[Optional[Tensor], Optional[Tensor]]]
 
 
 @dataclass
@@ -32,20 +33,23 @@ class WorldModelEnv:
         denoiser: Denoiser,
         upsampler: Optional[Denoiser],
         rew_end_model: Optional[RewEndModel],
-        spawn_dir: Path,
+        init_source: Union[Path, Iterable[Batch]],
         num_envs: int,
         seq_length: int,
         cfg: WorldModelEnvConfig,
         return_denoising_trajectory: bool = False,
     ) -> None:
-        assert num_envs == 1  # for csgo only
         self.sampler_next_obs = DiffusionSampler(denoiser, cfg.diffusion_sampler_next_obs)
         self.sampler_upsampling = None if upsampler is None else DiffusionSampler(upsampler, cfg.diffusion_sampler_upsampling)
         self.rew_end_model = rew_end_model
         self.horizon = cfg.horizon
         self.return_denoising_trajectory = return_denoising_trajectory
         self.num_envs = num_envs
-        self.generator_init = self.make_generator_init(spawn_dir, cfg.num_batches_to_preload)
+        self.num_actions = denoiser.cfg.inner_model.num_actions
+        if isinstance(init_source, (str, Path)):
+            self.generator_init = self.make_generator_init_from_spawn(Path(init_source), cfg.num_batches_to_preload)
+        else:
+            self.generator_init = self.make_generator_init_from_dataloader(init_source, cfg.num_batches_to_preload)
         
         self.n_skip_next_obs = seq_length - self.sampler_next_obs.denoiser.cfg.inner_model.num_steps_conditioning
         self.n_skip_upsampling = None if upsampler is None else seq_length - self.sampler_upsampling.denoiser.cfg.inner_model.num_steps_conditioning
@@ -94,6 +98,34 @@ class WorldModelEnv:
             self.obs_full_res_buffer[:, -1] = next_obs_full
 
         info = {}
+        dead = torch.logical_or(end.bool(), trunc.bool())
+        if dead.any():
+            if self.sampler_upsampling is None:
+                final_obs = next_obs[dead]
+            else:
+                final_obs = next_obs_full[dead]
+
+            obs_new, obs_full_res_new, act_new, next_act_new, (hx_new, cx_new) = self.generator_init.send(int(dead.sum()))
+
+            self.obs_buffer[dead] = obs_new
+            self.act_buffer[dead] = act_new
+            if self.sampler_upsampling is not None:
+                self.obs_full_res_buffer[dead] = obs_full_res_new
+
+            self.ep_len[dead] = 0
+            if self.rew_end_model is not None:
+                self.hx_rew_end[:, dead] = hx_new
+                self.cx_rew_end[:, dead] = cx_new
+
+            info["final_observation"] = final_obs
+            if self.sampler_upsampling is None:
+                next_obs[dead] = obs_new[:, -1]
+                info["burnin_obs"] = obs_new[:, :-1]
+            else:
+                next_obs_full[dead] = obs_full_res_new[:, -1]
+                next_obs[dead] = obs_new[:, -1]
+                info["burnin_obs"] = obs_full_res_new[:, :-1]
+
         if self.return_denoising_trajectory:
             info["denoising_trajectory"] = torch.stack(denoising_trajectory, dim=1)
             
@@ -127,7 +159,7 @@ class WorldModelEnv:
         return rew, end
 
     @coroutine
-    def make_generator_init(
+    def make_generator_init_from_spawn(
         self,
         spawn_dir: Path,
         num_batches_to_preload: int,
@@ -169,3 +201,80 @@ class WorldModelEnv:
                 cx = torch.stack(cx_[c : c + num_dead]).unsqueeze(0) if self.rew_end_model is not None else None
                 c += num_dead
                 num_dead = yield obs, obs_full_res, act, next_act, (hx, cx)
+
+    @coroutine
+    def make_generator_init_from_dataloader(
+        self,
+        data_loader: Iterable[Batch],
+        num_batches_to_preload: int,
+    ) -> Generator[InitialCondition, None, None]:
+        num_dead = yield
+
+        data_iter = iter(data_loader)
+        obs_pool: List[Tensor] = []
+        obs_full_res_pool: List[Tensor] = []
+        act_pool: List[Tensor] = []
+        next_act_pool: List[Tensor] = []
+        hx_pool: List[Tensor] = []
+        cx_pool: List[Tensor] = []
+
+        while True:
+            while len(obs_pool) < num_dead:
+                for _ in range(num_batches_to_preload):
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
+                        data_iter = iter(data_loader)
+                        batch = next(data_iter)
+
+                    batch = batch.to(self.device)
+                    obs = batch.obs
+                    act = batch.act
+
+                    if self.sampler_upsampling is not None:
+                        if len(batch.info) == 0 or "full_res" not in batch.info[0]:
+                            raise ValueError("upsampler requires batch.info[*]['full_res'] to be present")
+                        obs_full_res = torch.stack([info["full_res"] for info in batch.info]).to(self.device)
+                    else:
+                        obs_full_res = None
+
+                    if self.rew_end_model is not None:
+                        with torch.no_grad():
+                            _, _, (hx, cx) = self.rew_end_model.predict_rew_end(obs[:, :-1], act[:, :-1], obs[:, 1:])
+                        hx = hx[0]
+                        cx = cx[0]
+                    else:
+                        hx = cx = None
+
+                    for i in range(obs.size(0)):
+                        obs_pool.append(obs[i])
+                        act_pool.append(act[i])
+                        next_act_pool.append(act[i, -1])
+                        if obs_full_res is not None:
+                            obs_full_res_pool.append(obs_full_res[i])
+                        if hx is not None and cx is not None:
+                            hx_pool.append(hx[i])
+                            cx_pool.append(cx[i])
+
+            obs = torch.stack(obs_pool[:num_dead])
+            act = torch.stack(act_pool[:num_dead])
+            next_act = torch.stack(next_act_pool[:num_dead])
+            obs_full_res = (
+                torch.stack(obs_full_res_pool[:num_dead]) if self.sampler_upsampling is not None else None
+            )
+            if self.rew_end_model is not None:
+                hx = torch.stack(hx_pool[:num_dead]).unsqueeze(0)
+                cx = torch.stack(cx_pool[:num_dead]).unsqueeze(0)
+            else:
+                hx = cx = None
+
+            obs_pool = obs_pool[num_dead:]
+            act_pool = act_pool[num_dead:]
+            next_act_pool = next_act_pool[num_dead:]
+            if self.sampler_upsampling is not None:
+                obs_full_res_pool = obs_full_res_pool[num_dead:]
+            if self.rew_end_model is not None:
+                hx_pool = hx_pool[num_dead:]
+                cx_pool = cx_pool[num_dead:]
+
+            num_dead = yield obs, obs_full_res, act, next_act, (hx, cx)

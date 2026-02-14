@@ -205,7 +205,15 @@ class Trainer(StateDictMixin):
                 bs = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights))
                 dl_actor_critic = make_data_loader(batch_sampler=bs)
                 wm_env_cfg = instantiate(cfg.world_model_env)
-                rl_env = WorldModelEnv(self.agent.denoiser, self.agent.upsampler, self.agent.rew_end_model, dl_actor_critic, wm_env_cfg)
+                rl_env = WorldModelEnv(
+                    self.agent.denoiser,
+                    self.agent.upsampler,
+                    self.agent.rew_end_model,
+                    dl_actor_critic,
+                    c.batch_size,
+                    sl,
+                    wm_env_cfg,
+                )
 
                 if cfg.training.compile_wm:
                     rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")

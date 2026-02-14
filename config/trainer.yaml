@@ -103,3 +103,40 @@ upsampler:
   optimizer: ${denoiser.optimizer}
   sigma_distribution: ${denoiser.sigma_distribution}
 
+rew_end_model:
+  training:
+    seq_length: 16
+    start_after_epochs: 0
+    steps_first_epoch: 400
+    steps_per_epoch: 400
+    sample_weights: null
+    batch_size: 16
+    grad_acc_steps: 8
+    lr_warmup_steps: 100
+    max_grad_norm: 10.0
+
+  optimizer: ${denoiser.optimizer}
+
+actor_critic:
+  training:
+    start_after_epochs: 0
+    steps_first_epoch: 1000
+    steps_per_epoch: 1000
+    sample_weights: null
+    batch_size: 16
+    grad_acc_steps: 1
+    lr_warmup_steps: 0
+    max_grad_norm: 10.0
+
+  optimizer:
+    lr: 3e-4
+    weight_decay: 0.0
+    eps: 1e-8
+
+  actor_critic_loss:
+    _target_: models.actor_critic.ActorCriticLossConfig
+    backup_every: 20
+    gamma: 0.99
+    lambda_: 0.95
+    weight_value_loss: 0.5
+    weight_entropy_loss: 0.01

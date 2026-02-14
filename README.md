@@ -64,6 +64,30 @@ The provided configuration took 12 days on a RTX 4090.
 
 ---
 
+## Atari 100k (Consistency World Model + Actor-Critic)
+
+This repo includes a minimal Atari config that can load a merged consistency checkpoint (fast denoiser + reward/end model) and train the actor-critic in imagination.
+
+1. Put your merged checkpoint somewhere accessible (e.g. `merged_consistency.pt`).
+2. Pick the game by setting `env.train.id` / `env.test.id` (default is `ALE/Breakout-v5` in `config/env/atari.yaml`).
+3. Run training:
+
+```bash
+python src/main.py \
+  env=atari \
+  agent=atari \
+  world_model_env=consistency_fast \
+  initialization.path_to_ckpt=/path/to/merged_consistency.pt \
+  initialization.load_actor_critic=False
+```
+
+Notes:
+- To keep the world model frozen and train only the actor-critic, set `denoiser.training.steps_first_epoch=0`, `denoiser.training.steps_per_epoch=0`, `rew_end_model.training.steps_first_epoch=0`, and `rew_end_model.training.steps_per_epoch=0`.
+- The default `collection.train.num_steps_total` is already `100000` in `config/trainer.yaml`. Adjust it if you want a different interaction budget.
+- Ensure your Atari ROMs are available to Gymnasium/ALE before running.
+
+---
+
 <a name="citation"></a>
 ## [⬆️](#quick-links) Citation
 
