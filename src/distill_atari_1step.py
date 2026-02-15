@@ -205,7 +205,7 @@ def main() -> None:
 
         if args.consistency_model:
             x0 = batch.obs[:, n]
-            eps = torch.randn_like(x0, generator=gen_student)
+            eps = torch.randn(x0.shape, device=device, generator=gen_student)
             idx = torch.randint(0, len(sigmas) - 1, (x0.size(0),), device=device)
             sigma1 = sigmas[idx]
             sigma2 = sigmas[idx + 1]
