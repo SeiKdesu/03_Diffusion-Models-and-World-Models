@@ -12,6 +12,9 @@ denoiser:
     depths: [2,2,2,2]
     channels: [64,64,64,64]
     attn_depths: [0,0,0,0]
+    conditioning:
+      improved: false
+      mlp_mult: 2
 
 rew_end_model:
   _target_: models.rew_end_model.RewEndModelConfig
@@ -30,4 +33,3 @@ actor_critic:
   img_size: ${env.train.size}
   channels: [32,32,64,64]
   down: [1,1,1,1]
-

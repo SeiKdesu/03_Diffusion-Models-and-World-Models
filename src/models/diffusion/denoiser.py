@@ -71,6 +71,18 @@ class Denoiser(nn.Module):
         c_noise = sigma.log() / 4
         return Conditioners(*(add_dims(c, n) for c, n in zip((c_in, c_out, c_skip, c_noise), (4, 4, 4, 1, 1))))
 
+    def compute_conditioners_consistency(self, sigma: Tensor, sigma_min: float) -> Conditioners:
+        """Consistency model boundary-condition preconditioning (Karras et al.)."""
+        sigma_eff = (sigma**2 + self.cfg.sigma_offset_noise**2).sqrt()
+        sigma_min_t = torch.as_tensor(sigma_min, device=sigma.device, dtype=sigma.dtype)
+        sigma_min_eff = (sigma_min_t**2 + self.cfg.sigma_offset_noise**2).sqrt()
+
+        c_in = 1 / (sigma_eff**2 + self.cfg.sigma_data**2).sqrt()
+        c_skip = self.cfg.sigma_data**2 / ((sigma_eff - sigma_min_eff) ** 2 + self.cfg.sigma_data**2)
+        c_out = (sigma_eff - sigma_min_eff) * self.cfg.sigma_data / (sigma_eff**2 + self.cfg.sigma_data**2).sqrt()
+        c_noise = sigma_eff.log() / 4
+        return Conditioners(*(add_dims(c, n) for c, n in zip((c_in, c_out, c_skip, c_noise), (4, 4, 4, 1, 1))))
+
     def compute_model_output(self, noisy_next_obs: Tensor, obs: Tensor, act: Tensor, cs: Conditioners) -> Tensor:
         rescaled_obs = obs / self.cfg.sigma_data
         rescaled_noise = noisy_next_obs * cs.c_in
@@ -88,6 +100,47 @@ class Denoiser(nn.Module):
         cs = self.compute_conditioners(sigma)
         model_output = self.compute_model_output(noisy_next_obs, obs, act, cs)
         denoised = self.wrap_model_output(noisy_next_obs, model_output, cs)
+        return denoised
+
+    @torch.no_grad()
+    def denoise_consistency(self, noisy_next_obs: Tensor, sigma: Tensor, obs: Tensor, act: Tensor, *, sigma_min: float) -> Tensor:
+        cs = self.compute_conditioners_consistency(sigma, sigma_min)
+        model_output = self.compute_model_output(noisy_next_obs, obs, act, cs)
+        denoised = cs.c_skip * noisy_next_obs + cs.c_out * model_output
+        denoised = denoised.clamp(-1, 1)
+        return denoised
+
+    def denoise_with_grad(
+        self,
+        noisy_next_obs: Tensor,
+        sigma: Tensor,
+        obs: Tensor,
+        act: Tensor,
+        *,
+        clip: bool = True,
+    ) -> Tensor:
+        cs = self.compute_conditioners(sigma)
+        model_output = self.compute_model_output(noisy_next_obs, obs, act, cs)
+        denoised = cs.c_skip * noisy_next_obs + cs.c_out * model_output
+        if clip:
+            denoised = denoised.clamp(-1, 1)
+        return denoised
+
+    def denoise_consistency_with_grad(
+        self,
+        noisy_next_obs: Tensor,
+        sigma: Tensor,
+        obs: Tensor,
+        act: Tensor,
+        *,
+        sigma_min: float,
+        clip: bool = True,
+    ) -> Tensor:
+        cs = self.compute_conditioners_consistency(sigma, sigma_min)
+        model_output = self.compute_model_output(noisy_next_obs, obs, act, cs)
+        denoised = cs.c_skip * noisy_next_obs + cs.c_out * model_output
+        if clip:
+            denoised = denoised.clamp(-1, 1)
         return denoised
 
     def forward(self, batch: Batch) -> LossAndLogs:
