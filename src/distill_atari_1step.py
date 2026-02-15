@@ -21,6 +21,7 @@ from data import BatchSampler, Dataset, collate_segments_to_batch
 from envs import make_atari_env
 from metrics import get_lpips_model, lpips_distance
 from models.diffusion import DiffusionSampler, DiffusionSamplerConfig, Denoiser
+from models.diffusion.diffusion_sampler import build_sigmas
 from utils import set_seed
 
 
@@ -41,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--consistency-weight", type=float, default=0.0)
     parser.add_argument("--consistency-noise-std", type=float, default=0.05)
+    parser.add_argument("--consistency-model", action="store_true", help="Use consistency training (t1,t2) instead of output distillation.")
+    parser.add_argument("--consistency-num-scales", type=int, default=18)
+    parser.add_argument("--consistency-sigma-min", type=float, default=2e-3)
+    parser.add_argument("--consistency-sigma-max", type=float, default=5.0)
+    parser.add_argument("--consistency-rho", type=float, default=7.0)
+    parser.add_argument("--consistency-anchor-weight", type=float, default=0.0)
     parser.add_argument("--lpips-weight", type=float, default=0.0)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
@@ -166,6 +173,16 @@ def main() -> None:
     teacher_sampler = build_sampler(teacher.denoiser, args.teacher_steps)
     student_sampler = build_sampler(student, args.student_steps)
 
+    if args.consistency_model:
+        sigmas = build_sigmas(
+            args.consistency_num_scales,
+            args.consistency_sigma_min,
+            args.consistency_sigma_max,
+            args.consistency_rho,
+            device,
+        )
+        sigmas = sigmas[:-1]  # drop 0 for consistency training
+
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr)
 
     lpips_model, lpips_err = get_lpips_model(device)
@@ -186,14 +203,36 @@ def main() -> None:
         gen_teacher = torch.Generator(device=device).manual_seed(seed)
         gen_student = torch.Generator(device=device).manual_seed(seed)
 
-        with torch.no_grad():
-            teacher_next, _ = teacher_sampler.sample(prev_obs, prev_act, generator=gen_teacher)
+        if args.consistency_model:
+            x0 = batch.obs[:, n]
+            eps = torch.randn_like(x0, generator=gen_student)
+            idx = torch.randint(0, len(sigmas) - 1, (x0.size(0),), device=device)
+            sigma1 = sigmas[idx]
+            sigma2 = sigmas[idx + 1]
 
-        student_next, _ = student_sampler.sample_with_grad(prev_obs, prev_act, generator=gen_student)
+            noisy1 = x0 + sigma1.view(-1, 1, 1, 1) * eps
+            noisy2 = x0 + sigma2.view(-1, 1, 1, 1) * eps
 
-        loss = F.mse_loss(student_next, teacher_next)
+            prev_obs_flat = prev_obs.reshape(prev_obs.size(0), -1, prev_obs.size(-2), prev_obs.size(-1))
+            y1 = student.denoise_consistency_with_grad(
+                noisy1, sigma1, prev_obs_flat, prev_act, sigma_min=args.consistency_sigma_min
+            )
+            y2 = student.denoise_consistency_with_grad(
+                noisy2, sigma2, prev_obs_flat, prev_act, sigma_min=args.consistency_sigma_min
+            )
 
-        if args.consistency_weight > 0:
+            loss = F.mse_loss(y1, y2)
+            if args.consistency_anchor_weight > 0:
+                loss = loss + args.consistency_anchor_weight * F.mse_loss(y2, x0)
+        else:
+            with torch.no_grad():
+                teacher_next, _ = teacher_sampler.sample(prev_obs, prev_act, generator=gen_teacher)
+
+            student_next, _ = student_sampler.sample_with_grad(prev_obs, prev_act, generator=gen_student)
+
+            loss = F.mse_loss(student_next, teacher_next)
+
+        if (not args.consistency_model) and args.consistency_weight > 0:
             noisy_prev_obs = prev_obs + torch.randn_like(prev_obs) * args.consistency_noise_std
             gen_student_2 = torch.Generator(device=device).manual_seed(seed + 1)
             student_next_noisy, _ = student_sampler.sample_with_grad(noisy_prev_obs, prev_act, generator=gen_student_2)

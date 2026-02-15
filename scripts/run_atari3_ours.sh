@@ -5,7 +5,7 @@ GAMES=("BreakoutNoFrameskip-v4" "PongNoFrameskip-v4" "SeaquestNoFrameskip-v4")
 GAMES_CSV="BreakoutNoFrameskip-v4,PongNoFrameskip-v4,SeaquestNoFrameskip-v4"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-TEACHER_STEPS="${TEACHER_STEPS:-16}"
+TEACHER_STEPS="${TEACHER_STEPS:-3}"
 DISTILL_ITERS="${DISTILL_ITERS:-500}"
 COLLECT_STEPS="${COLLECT_STEPS:-5000}"
 

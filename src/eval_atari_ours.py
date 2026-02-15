@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--games", type=str, default=DEFAULT_GAMES)
     parser.add_argument("--steps", type=str, default="1,2,4,8,teacher")
     parser.add_argument("--teacher-steps", type=int, default=16)
-    parser.add_argument("--horizon", type=int, default=50)
+    parser.add_argument("--horizon", type=int, default=15)
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--dataset-dir", type=str, default="dataset/atari3/{game}")
     parser.add_argument("--collect-steps", type=int, default=0)
@@ -50,12 +50,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--rl-eval", action="store_true")
-    parser.add_argument("--rl-updates", type=int, default=500)
-    parser.add_argument("--rl-batch-size", type=int, default=8)
-    parser.add_argument("--rl-episodes", type=int, default=20)
-    parser.add_argument("--rl-lr", type=float, default=3e-4)
+    parser.add_argument("--rl-updates", type=int, default=None)
+    parser.add_argument("--rl-updates-first", type=int, default=5000)
+    parser.add_argument("--rl-updates-per-epoch", type=int, default=400)
+    parser.add_argument("--rl-epochs", type=int, default=1)
+    parser.add_argument("--rl-batch-size", type=int, default=32)
+    parser.add_argument("--rl-episodes", type=int, default=100)
+    parser.add_argument("--rl-lr", type=float, default=1e-4)
     parser.add_argument("--rl-seed", type=int, default=0)
     parser.add_argument("--rl-log-every", type=int, default=50)
+    parser.add_argument("--rl-horizon", type=int, default=15)
+    parser.add_argument("--student-consistency", action="store_true", help="Use consistency sampler for student.")
+    parser.add_argument("--consistency-sigma-min", type=float, default=2e-3)
     parser.add_argument("--deterministic", action="store_true")
     return parser.parse_args()
 
@@ -109,7 +115,15 @@ def maybe_collect_dataset(
     dataset.save_to_default_path()
 
 
-def build_sampler(denoiser: Denoiser, steps: int, deterministic: bool, seed: int) -> DiffusionSampler:
+def build_sampler(
+    denoiser: Denoiser,
+    steps: int,
+    deterministic: bool,
+    seed: int,
+    *,
+    use_consistency: bool = False,
+    sigma_min_consistency: float = 2e-3,
+) -> DiffusionSampler:
     cfg = DiffusionSamplerConfig(
         num_steps_denoising=steps,
         sigma_min=2e-3,
@@ -122,6 +136,8 @@ def build_sampler(denoiser: Denoiser, steps: int, deterministic: bool, seed: int
         s_noise=1.0,
         deterministic=deterministic,
         seed=seed,
+        use_consistency=use_consistency,
+        sigma_min_consistency=sigma_min_consistency,
     )
     return DiffusionSampler(denoiser, cfg)
 
@@ -182,6 +198,9 @@ def prediction_metrics(
     deterministic: bool,
     seed: int,
     lpips_model,
+    *,
+    use_consistency: bool = False,
+    sigma_min_consistency: float = 2e-3,
 ) -> Tuple[float, float, float]:
     if len(dataset) == 0:
         return float("nan"), float("nan"), float("nan")
@@ -194,7 +213,14 @@ def prediction_metrics(
         num_workers=0,
         pin_memory=(device.type == "cuda"),
     )
-    sampler = build_sampler(denoiser, steps, deterministic, seed)
+    sampler = build_sampler(
+        denoiser,
+        steps,
+        deterministic,
+        seed,
+        use_consistency=use_consistency,
+        sigma_min_consistency=sigma_min_consistency,
+    )
     num_batches = max(1, pred_samples // pred_batch_size)
     psnr_vals = []
     ssim_vals = []
@@ -234,6 +260,9 @@ def rl_train_and_eval(
     deterministic: bool,
     steps: int,
     log_every: int,
+    horizon: int,
+    use_consistency: bool,
+    sigma_min_consistency: float,
 ) -> Tuple[float, float]:
     torch.manual_seed(seed)
     n = denoiser.cfg.inner_model.num_steps_conditioning
@@ -241,7 +270,7 @@ def rl_train_and_eval(
     dl = DataLoader(dataset, batch_sampler=bs, collate_fn=collate_segments_to_batch, num_workers=0)
 
     wm_cfg = WorldModelEnvConfig(
-        horizon=50,
+        horizon=horizon,
         num_batches_to_preload=8,
         diffusion_sampler=DiffusionSamplerConfig(
             num_steps_denoising=steps,
@@ -255,6 +284,8 @@ def rl_train_and_eval(
             s_noise=1.0,
             deterministic=deterministic,
             seed=seed,
+            use_consistency=use_consistency,
+            sigma_min_consistency=sigma_min_consistency,
         ),
     )
     wm_env = WorldModelEnv(denoiser, rew_end_model, dl, wm_cfg)
@@ -373,6 +404,7 @@ def main() -> None:
             if denoiser is None:
                 continue
             for steps in steps_parsed:
+                use_consistency = bool(args.student_consistency and model_name == "student")
                 sampler_cfg = DiffusionSamplerConfig(
                     num_steps_denoising=steps,
                     sigma_min=2e-3,
@@ -385,6 +417,8 @@ def main() -> None:
                     s_noise=1.0,
                     deterministic=args.deterministic,
                     seed=args.seed,
+                    use_consistency=use_consistency,
+                    sigma_min_consistency=args.consistency_sigma_min,
                 )
                 wm_cfg = WorldModelEnvConfig(
                     horizon=args.horizon,
@@ -415,6 +449,8 @@ def main() -> None:
                     args.deterministic,
                     args.seed,
                     lpips_model,
+                    use_consistency=use_consistency,
+                    sigma_min_consistency=args.consistency_sigma_min,
                 )
 
                 world_model_rows.append(
@@ -437,6 +473,14 @@ def main() -> None:
             for model_name, denoiser in [("teacher", teacher.denoiser), ("student", student)]:
                 if denoiser is None:
                     continue
+                if args.rl_updates is None:
+                    total_updates = args.rl_updates_first + max(0, args.rl_epochs - 1) * args.rl_updates_per_epoch
+                else:
+                    total_updates = args.rl_updates
+                print(
+                    f"[rl] schedule: updates={total_updates} (first={args.rl_updates_first}, per_epoch={args.rl_updates_per_epoch}, epochs={args.rl_epochs}) "
+                    f"batch={args.rl_batch_size} horizon={args.rl_horizon}"
+                )
                 mean_ret, std_ret = rl_train_and_eval(
                     denoiser=denoiser,
                     rew_end_model=teacher.rew_end_model,
@@ -444,7 +488,7 @@ def main() -> None:
                     env_cfg=cfg_env,
                     dataset=dataset,
                     device=device,
-                    updates=args.rl_updates,
+                    updates=total_updates,
                     batch_size=args.rl_batch_size,
                     lr=args.rl_lr,
                     episodes=args.rl_episodes,
@@ -452,6 +496,9 @@ def main() -> None:
                     deterministic=args.deterministic,
                     steps=1 if model_name == "student" else args.teacher_steps,
                     log_every=args.rl_log_every,
+                    horizon=args.rl_horizon,
+                    use_consistency=bool(args.student_consistency and model_name == "student"),
+                    sigma_min_consistency=args.consistency_sigma_min,
                 )
                 rl_rows.append(
                     {
