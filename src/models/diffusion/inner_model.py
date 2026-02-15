@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
@@ -10,6 +10,12 @@ from ..blocks import Conv3x3, FourierFeatures, GroupNorm, UNet
 
 
 @dataclass
+class ConditioningConfig:
+    improved: bool = False
+    mlp_mult: int = 2
+
+
+@dataclass
 class InnerModelConfig:
     img_channels: int
     num_steps_conditioning: int
@@ -18,6 +24,7 @@ class InnerModelConfig:
     channels: List[int]
     attn_depths: List[bool]
     num_actions: Optional[int] = None
+    conditioning: ConditioningConfig = field(default_factory=ConditioningConfig)
 
 
 class InnerModel(nn.Module):
@@ -33,6 +40,14 @@ class InnerModel(nn.Module):
             nn.SiLU(),
             nn.Linear(cfg.cond_channels, cfg.cond_channels),
         )
+        self.cond_improve = None
+        if cfg.conditioning.improved:
+            hidden = max(1, cfg.cond_channels * int(cfg.conditioning.mlp_mult))
+            self.cond_improve = nn.Sequential(
+                nn.Linear(cfg.cond_channels, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, cfg.cond_channels),
+            )
         self.conv_in = Conv3x3((cfg.num_steps_conditioning + 1) * cfg.img_channels, cfg.channels[0])
 
         self.unet = UNet(cfg.cond_channels, cfg.depths, cfg.channels, cfg.attn_depths)
@@ -43,6 +58,8 @@ class InnerModel(nn.Module):
 
     def forward(self, noisy_next_obs: Tensor, c_noise: Tensor, obs: Tensor, act: Tensor) -> Tensor:
         cond = self.cond_proj(self.noise_emb(c_noise) + self.act_emb(act))
+        if self.cond_improve is not None:
+            cond = cond + self.cond_improve(cond)
         x = self.conv_in(torch.cat((obs, noisy_next_obs), dim=1))
         x, _, _ = self.unet(x, cond)
         x = self.conv_out(F.silu(self.norm_out(x)))
