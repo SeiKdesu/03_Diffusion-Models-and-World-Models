@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import random
 import time
 from pathlib import Path
@@ -19,7 +20,7 @@ from torch.utils.data import DataLoader
 
 from agent import Agent
 from coroutines.collector import make_collector, NumToCollect
-from data import BatchSampler, Dataset, collate_segments_to_batch
+from data import Batch, BatchSampler, Dataset, collate_segments_to_batch
 from envs import WorldModelEnv, WorldModelEnvConfig, make_atari_env
 from metrics import get_lpips_model, lpips_distance, psnr, ssim
 from models.actor_critic import ActorCritic, ActorCriticConfig, ActorCriticLossConfig
@@ -37,6 +38,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-steps", type=int, default=16)
     parser.add_argument("--horizon", type=int, default=15)
     parser.add_argument("--episodes", type=int, default=5)
+    parser.add_argument("--metrics", type=str, default="psnr,ssim,lpips")
+    parser.add_argument(
+        "--rollout-mode",
+        type=str,
+        choices=["aligned", "closed_loop_free", "both"],
+        default="closed_loop_free",
+        help="Per-horizon rollout evaluation mode.",
+    )
+    parser.add_argument("--save-per-step-metrics", action="store_true")
+    parser.add_argument("--rollout-out-dir", type=str, default="results/eval_rollout")
     parser.add_argument("--dataset-dir", type=str, default="dataset/atari3/{game}")
     parser.add_argument("--collect-steps", type=int, default=0)
     parser.add_argument("--pred-samples", type=int, default=256)
@@ -97,6 +108,24 @@ def resolve_dataset_path(dataset_dir: str, game_base: str) -> Path:
     return p
 
 
+def parse_metrics_arg(arg: str) -> List[str]:
+    return [m.strip().lower() for m in arg.split(",") if m.strip()]
+
+
+def select_batch(batch: Batch, indices: torch.Tensor) -> Batch:
+    idx = indices.tolist()
+    return Batch(
+        obs=batch.obs[idx],
+        act=batch.act[idx],
+        rew=batch.rew[idx],
+        end=batch.end[idx],
+        trunc=batch.trunc[idx],
+        mask_padding=batch.mask_padding[idx],
+        info=[batch.info[i] for i in idx],
+        segment_ids=[batch.segment_ids[i] for i in idx],
+    )
+
+
 def maybe_collect_dataset(
     dataset: Dataset,
     env_cfg,
@@ -147,6 +176,141 @@ def load_student_denoiser(path: Path, teacher: Denoiser) -> Denoiser:
     student = Denoiser(teacher.cfg)
     student.load_state_dict({k.split(".", 1)[1]: v for k, v in sd.items() if k.startswith("denoiser.")})
     return student
+
+
+def _init_stat_buffers(horizon: int) -> Tuple[np.ndarray, np.ndarray]:
+    return np.zeros(horizon, dtype=np.float64), np.zeros(horizon, dtype=np.int64)
+
+
+def _update_stats(sum_buf: np.ndarray, count_buf: np.ndarray, values: List[float]) -> None:
+    for i, v in enumerate(values):
+        if not math.isnan(v):
+            sum_buf[i] += float(v)
+            count_buf[i] += 1
+
+
+def _finalize_stats(sum_buf: np.ndarray, count_buf: np.ndarray) -> List[float]:
+    out = []
+    for s, c in zip(sum_buf, count_buf):
+        out.append(float(s / c) if c > 0 else float("nan"))
+    return out
+
+
+def rollout_with_actions(
+    sampler: DiffusionSampler,
+    prev_obs: torch.Tensor,
+    prev_act: torch.Tensor,
+    actions: torch.Tensor,
+) -> torch.Tensor:
+    obs_hist = prev_obs.clone()
+    act_hist = prev_act.clone()
+    preds: List[torch.Tensor] = []
+    for t in range(actions.size(1)):
+        act = actions[:, t]
+        act_hist[:, -1] = act
+        next_obs, _ = sampler.sample(obs_hist, act_hist)
+        preds.append(next_obs)
+        obs_hist = obs_hist.roll(-1, dims=1)
+        obs_hist[:, -1] = next_obs
+        act_hist = act_hist.roll(-1, dims=1)
+        act_hist[:, -1] = act
+    return torch.stack(preds, dim=1)
+
+
+def rollout_closed_loop(
+    sampler: DiffusionSampler,
+    prev_obs: torch.Tensor,
+    prev_act: torch.Tensor,
+    policy: Optional[ActorCritic],
+    num_actions: int,
+    horizon: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    obs_hist = prev_obs.clone()
+    act_hist = prev_act.clone()
+    preds: List[torch.Tensor] = []
+    actions: List[torch.Tensor] = []
+    hx = torch.zeros(prev_obs.size(0), policy.lstm_dim, device=prev_obs.device) if policy is not None else None
+    cx = torch.zeros(prev_obs.size(0), policy.lstm_dim, device=prev_obs.device) if policy is not None else None
+    for _ in range(horizon):
+        if policy is None:
+            act = torch.randint(low=0, high=num_actions, size=(prev_obs.size(0),), device=prev_obs.device)
+        else:
+            logits, _, (hx, cx) = policy.predict_act_value(obs_hist[:, -1], (hx, cx))
+            act = Categorical(logits=logits).sample()
+        actions.append(act)
+        act_hist[:, -1] = act
+        next_obs, _ = sampler.sample(obs_hist, act_hist)
+        preds.append(next_obs)
+        obs_hist = obs_hist.roll(-1, dims=1)
+        obs_hist[:, -1] = next_obs
+        act_hist = act_hist.roll(-1, dims=1)
+        act_hist[:, -1] = act
+    return torch.stack(preds, dim=1), torch.stack(actions, dim=1)
+
+
+def compute_per_horizon_metrics(
+    preds: torch.Tensor,
+    *,
+    gt: Optional[torch.Tensor],
+    teacher_preds: Optional[torch.Tensor],
+    metrics: List[str],
+    lpips_model,
+) -> Dict[str, List[float]]:
+    horizon = preds.size(1)
+    metrics_set = set(metrics)
+    out: Dict[str, List[float]] = {
+        "psnr_to_gt": [],
+        "ssim_to_gt": [],
+        "lpips_to_gt": [],
+        "psnr_to_teacher": [],
+        "ssim_to_teacher": [],
+        "lpips_to_teacher": [],
+        "temporal_lpips_pred": [],
+        "pixel_delta_norm_pred": [],
+    }
+    for t in range(horizon):
+        pred = preds[:, t]
+        if gt is not None:
+            gt_t = gt[:, t]
+            out["psnr_to_gt"].append(psnr(pred, gt_t).mean().item() if "psnr" in metrics_set else float("nan"))
+            out["ssim_to_gt"].append(ssim(pred, gt_t).mean().item() if "ssim" in metrics_set else float("nan"))
+            if "lpips" in metrics_set and lpips_model is not None:
+                out["lpips_to_gt"].append(lpips_distance(lpips_model, pred, gt_t).mean().item())
+            else:
+                out["lpips_to_gt"].append(float("nan"))
+        else:
+            out["psnr_to_gt"].append(float("nan"))
+            out["ssim_to_gt"].append(float("nan"))
+            out["lpips_to_gt"].append(float("nan"))
+
+        if teacher_preds is not None:
+            teacher_t = teacher_preds[:, t]
+            out["psnr_to_teacher"].append(
+                psnr(pred, teacher_t).mean().item() if "psnr" in metrics_set else float("nan")
+            )
+            out["ssim_to_teacher"].append(
+                ssim(pred, teacher_t).mean().item() if "ssim" in metrics_set else float("nan")
+            )
+            if "lpips" in metrics_set and lpips_model is not None:
+                out["lpips_to_teacher"].append(lpips_distance(lpips_model, pred, teacher_t).mean().item())
+            else:
+                out["lpips_to_teacher"].append(float("nan"))
+        else:
+            out["psnr_to_teacher"].append(float("nan"))
+            out["ssim_to_teacher"].append(float("nan"))
+            out["lpips_to_teacher"].append(float("nan"))
+
+        if t == 0:
+            out["temporal_lpips_pred"].append(float("nan"))
+            out["pixel_delta_norm_pred"].append(float("nan"))
+        else:
+            prev = preds[:, t - 1]
+            if "lpips" in metrics_set and lpips_model is not None:
+                out["temporal_lpips_pred"].append(lpips_distance(lpips_model, pred, prev).mean().item())
+            else:
+                out["temporal_lpips_pred"].append(float("nan"))
+            out["pixel_delta_norm_pred"].append(F.mse_loss(pred, prev).item())
+    return out
 
 
 def rollout_wm(
@@ -355,9 +519,12 @@ def main() -> None:
     for s in steps_list:
         steps_parsed.append(args.teacher_steps if s == "teacher" else int(s))
 
-    lpips_model, lpips_err = get_lpips_model(device)
-    if lpips_model is None:
-        print(f"[eval] {lpips_err}. LPIPS metrics will be skipped.")
+    metrics = parse_metrics_arg(args.metrics)
+    lpips_model = None
+    if "lpips" in metrics:
+        lpips_model, lpips_err = get_lpips_model(device)
+        if lpips_model is None:
+            print(f"[eval] {lpips_err}. LPIPS metrics will be skipped.")
 
     world_model_rows: List[Dict[str, object]] = []
     rl_rows: List[Dict[str, object]] = []
@@ -399,6 +566,9 @@ def main() -> None:
         dataset.load_from_default_path()
         maybe_collect_dataset(dataset, cfg_env, teacher, args.collect_steps, device)
         dataset.load_from_default_path()
+        if len(dataset) == 0 or dataset.num_episodes == 0:
+            print(f"[eval] dataset empty for {game_base} at {dataset_path}, skipping game")
+            continue
 
         for model_name, denoiser in [("teacher", teacher.denoiser), ("student", student)]:
             if denoiser is None:
@@ -468,6 +638,238 @@ def main() -> None:
                         "drift": drift,
                     }
                 )
+
+                if args.save_per_step_metrics:
+                    rollout_modes: List[str]
+                    if args.rollout_mode == "both":
+                        rollout_modes = ["aligned", "closed_loop_free"]
+                    else:
+                        rollout_modes = [args.rollout_mode]
+
+                    for mode in rollout_modes:
+                        per_step_rows: List[Dict[str, object]] = []
+                        horizon = args.horizon
+                        has_gt = mode == "aligned"
+                        reference_type = "none"
+
+                        if mode == "aligned":
+                            seq_len = denoiser.cfg.inner_model.num_steps_conditioning + horizon
+                            bs_aligned = BatchSampler(
+                                dataset,
+                                0,
+                                1,
+                                args.pred_batch_size,
+                                seq_len,
+                                sample_weights=None,
+                                can_sample_beyond_end=False,
+                            )
+                            dl_aligned = DataLoader(
+                                dataset,
+                                batch_sampler=bs_aligned,
+                                collate_fn=collate_segments_to_batch,
+                                num_workers=0,
+                                pin_memory=(device.type == "cuda"),
+                            )
+                            it_aligned = iter(dl_aligned)
+                            num_done = 0
+                            sums = {k: _init_stat_buffers(horizon) for k in [
+                                "psnr_to_gt",
+                                "ssim_to_gt",
+                                "lpips_to_gt",
+                                "psnr_to_teacher",
+                                "ssim_to_teacher",
+                                "lpips_to_teacher",
+                                "temporal_lpips_pred",
+                                "pixel_delta_norm_pred",
+                            ]}
+
+                            while num_done < args.pred_samples:
+                                batch = next(it_aligned).to(device)
+                                valid = batch.mask_padding[:, :seq_len].all(dim=1)
+                                if valid.any():
+                                    batch = select_batch(batch, valid.nonzero(as_tuple=False).squeeze(1))
+                                else:
+                                    continue
+                                if batch.obs.size(0) == 0:
+                                    continue
+                                take = min(batch.obs.size(0), args.pred_samples - num_done)
+                                if take < batch.obs.size(0):
+                                    batch = select_batch(batch, torch.arange(take, device=device))
+                                num_done += batch.obs.size(0)
+
+                                n = denoiser.cfg.inner_model.num_steps_conditioning
+                                prev_obs = batch.obs[:, :n]
+                                prev_act = batch.act[:, :n]
+                                gt = batch.obs[:, n : n + horizon]
+                                actions = batch.act[:, n - 1 : n - 1 + horizon]
+
+                                sampler = build_sampler(
+                                    denoiser,
+                                    steps,
+                                    args.deterministic,
+                                    args.seed,
+                                    use_consistency=use_consistency,
+                                    sigma_min_consistency=args.consistency_sigma_min,
+                                )
+                                preds = rollout_with_actions(sampler, prev_obs, prev_act, actions)
+
+                                teacher_preds = None
+                                if model_name != "teacher":
+                                    teacher_sampler = build_sampler(
+                                        teacher.denoiser,
+                                        args.teacher_steps,
+                                        args.deterministic,
+                                        args.seed,
+                                    )
+                                    teacher_preds = rollout_with_actions(teacher_sampler, prev_obs, prev_act, actions)
+                                    reference_type = "gt+teacher"
+                                else:
+                                    reference_type = "gt"
+
+                                metrics_out = compute_per_horizon_metrics(
+                                    preds,
+                                    gt=gt,
+                                    teacher_preds=teacher_preds,
+                                    metrics=metrics,
+                                    lpips_model=lpips_model,
+                                )
+                                for key, (sum_buf, count_buf) in sums.items():
+                                    _update_stats(sum_buf, count_buf, metrics_out[key])
+
+                            final_metrics = {k: _finalize_stats(v[0], v[1]) for k, v in sums.items()}
+
+                        else:
+                            seq_len = denoiser.cfg.inner_model.num_steps_conditioning
+                            bs_free = BatchSampler(
+                                dataset,
+                                0,
+                                1,
+                                1,
+                                seq_len,
+                                sample_weights=None,
+                                can_sample_beyond_end=False,
+                            )
+                            dl_free = DataLoader(
+                                dataset,
+                                batch_sampler=bs_free,
+                                collate_fn=collate_segments_to_batch,
+                                num_workers=0,
+                                pin_memory=(device.type == "cuda"),
+                            )
+                            it_free = iter(dl_free)
+                            sums = {k: _init_stat_buffers(horizon) for k in [
+                                "psnr_to_gt",
+                                "ssim_to_gt",
+                                "lpips_to_gt",
+                                "psnr_to_teacher",
+                                "ssim_to_teacher",
+                                "lpips_to_teacher",
+                                "temporal_lpips_pred",
+                                "pixel_delta_norm_pred",
+                            ]}
+
+                            for roll_idx in range(args.episodes):
+                                batch = next(it_free).to(device)
+                                valid = batch.mask_padding[:, :seq_len].all(dim=1)
+                                if valid.any():
+                                    batch = select_batch(batch, valid.nonzero(as_tuple=False).squeeze(1))
+                                else:
+                                    continue
+                                if batch.obs.size(0) == 0:
+                                    continue
+                                if batch.obs.size(0) > 1:
+                                    batch = select_batch(batch, torch.tensor([0], device=device))
+
+                                n = denoiser.cfg.inner_model.num_steps_conditioning
+                                prev_obs = batch.obs[:, :n]
+                                prev_act = batch.act[:, :n]
+
+                                sampler = build_sampler(
+                                    denoiser,
+                                    steps,
+                                    args.deterministic,
+                                    args.seed + roll_idx,
+                                    use_consistency=use_consistency,
+                                    sigma_min_consistency=args.consistency_sigma_min,
+                                )
+                                preds, actions = rollout_closed_loop(
+                                    sampler, prev_obs, prev_act, policy, num_actions, horizon
+                                )
+
+                                teacher_preds = None
+                                if model_name != "teacher":
+                                    teacher_sampler = build_sampler(
+                                        teacher.denoiser,
+                                        args.teacher_steps,
+                                        args.deterministic,
+                                        args.seed + roll_idx,
+                                    )
+                                    teacher_preds = rollout_with_actions(teacher_sampler, prev_obs, prev_act, actions)
+                                    reference_type = "teacher"
+
+                                metrics_out = compute_per_horizon_metrics(
+                                    preds,
+                                    gt=None,
+                                    teacher_preds=teacher_preds,
+                                    metrics=metrics,
+                                    lpips_model=lpips_model,
+                                )
+                                for key, (sum_buf, count_buf) in sums.items():
+                                    _update_stats(sum_buf, count_buf, metrics_out[key])
+
+                            final_metrics = {k: _finalize_stats(v[0], v[1]) for k, v in sums.items()}
+
+                        for t in range(horizon):
+                            per_step_rows.append(
+                                {
+                                    "game": game_base,
+                                    "model_name": model_name,
+                                    "steps": steps,
+                                    "seed": args.seed,
+                                    "rollout_mode": mode,
+                                    "horizon": t + 1,
+                                    "has_gt": has_gt,
+                                    "reference_type": reference_type,
+                                    "psnr_to_gt": final_metrics["psnr_to_gt"][t],
+                                    "ssim_to_gt": final_metrics["ssim_to_gt"][t],
+                                    "lpips_to_gt": final_metrics["lpips_to_gt"][t],
+                                    "psnr_to_teacher": final_metrics["psnr_to_teacher"][t],
+                                    "ssim_to_teacher": final_metrics["ssim_to_teacher"][t],
+                                    "lpips_to_teacher": final_metrics["lpips_to_teacher"][t],
+                                    "temporal_lpips_pred": final_metrics["temporal_lpips_pred"][t],
+                                    "pixel_delta_norm_pred": final_metrics["pixel_delta_norm_pred"][t],
+                                }
+                            )
+
+                        out_dir = Path(args.rollout_out_dir) / game_base / model_name / f"seed_{args.seed}"
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        out_csv = out_dir / "metrics_per_horizon.csv"
+                        write_header = not out_csv.exists()
+                        with out_csv.open("a", newline="") as f:
+                            writer = csv.DictWriter(
+                                f,
+                                fieldnames=[
+                                    "game",
+                                    "model_name",
+                                    "steps",
+                                    "seed",
+                                    "rollout_mode",
+                                    "horizon",
+                                    "has_gt",
+                                    "reference_type",
+                                    "psnr_to_gt",
+                                    "ssim_to_gt",
+                                    "lpips_to_gt",
+                                    "psnr_to_teacher",
+                                    "ssim_to_teacher",
+                                    "lpips_to_teacher",
+                                    "temporal_lpips_pred",
+                                    "pixel_delta_norm_pred",
+                                ],
+                            )
+                            if write_header:
+                                writer.writeheader()
+                            writer.writerows(per_step_rows)
 
         if args.rl_eval:
             for model_name, denoiser in [("teacher", teacher.denoiser), ("student", student)]:
