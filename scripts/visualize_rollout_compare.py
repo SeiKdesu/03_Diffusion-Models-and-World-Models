@@ -5,9 +5,14 @@ import argparse
 import json
 import math
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
 
 import numpy as np
 import torch
