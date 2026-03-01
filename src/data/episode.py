@@ -38,7 +38,7 @@ class Episode:
         return cls(
             **{
                 k: v.div(255).mul(2).sub(1) if k == "obs" else v
-                for k, v in torch.load(Path(path), map_location=map_location).items()
+                for k, v in _torch_load(Path(path), map_location=map_location).items()
             }
         )
 
@@ -60,3 +60,10 @@ def merge_info(info_a, info_b):
         **{k: torch.cat((info_a[k], info_b[k]), dim=0) for k in intersection},
     }
     return info
+
+
+def _torch_load(path: Path, map_location: Optional[torch.device] = None):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
