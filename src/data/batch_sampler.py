@@ -18,7 +18,10 @@ class BatchSampler(torch.utils.data.Sampler):
         sample_weights: Optional[List[float]] = None,
         can_sample_beyond_end: bool = False,
     ) -> None:
-        super().__init__(dataset)
+        try:
+            super().__init__(dataset)
+        except TypeError:
+            super().__init__()
         assert isinstance(dataset, Dataset)
         self.dataset = dataset
         self.rank = rank
